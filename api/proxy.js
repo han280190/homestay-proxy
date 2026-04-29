@@ -12,7 +12,7 @@
  */
 
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const API_SECRET_KEY = process.env.API_SECRET_KEY;
+const API_SECRET_KEY = process.env.API_SECRET_KEY || 'a7f3k9b2m1x5q8w6j4c7d9e2h5t3r1u0';  // Fallback
 const FRONTEND_ORIGIN = 'https://han280190.github.io';
 
 // Rate limiting: userName -> { failCount, lockUntil }
