@@ -1,16 +1,10 @@
 {
   "name": "homestay-proxy",
   "version": "1.0.0",
-  "description": "Security proxy for homestay app - PIN verify + session + audit log",
+  "description": "Security proxy for homestay app",
   "private": true,
   "scripts": {
-    "dev": "vercel dev",
-    "build": "echo 'No build needed for serverless'"
+    "dev": "vercel dev"
   },
-  "dependencies": {
-    "node-fetch": "^2.6.11"
-  },
-  "engines": {
-  "node": "18"
-}
+  "dependencies": {}
 }
