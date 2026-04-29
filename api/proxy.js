@@ -54,6 +54,11 @@ module.exports = (req, res) => {
       return handleLogin(res, userName, pin);
     }
 
+    // === Special: 'config' action doesn't need token (for login screen) ===
+    if (action === 'config') {
+      return forwardToAppsScript(res, body);
+    }
+
     // All other actions require valid session token
     if (!token || !validateSessionToken(token)) {
       return res.status(401).json({ ok: false, error: 'Invalid or expired token' });
