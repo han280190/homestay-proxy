@@ -1,187 +1,203 @@
 /**
- * Homestay Proxy v1
+ * Vercel Proxy for Homestay App v15
  * 
- * Chức năng:
- * 1. Verify PIN từ Google Sheets (USERS)
- * 2. Rate limit (5 sai → lock 10 phút)
- * 3. Session token (30 phút expire)
- * 4. Log audit vào Google Sheets (11. Audit_log)
- * 5. Forward request tới Apps Script với API key
+ * Security layer between Frontend (GitHub Pages) and Backend (Apps Script)
+ * 
+ * Handles:
+ * - PIN verification (converts PIN to session token)
+ * - Session token validation
+ * - Rate limiting (5 fails = 10min lock)
+ * - CORS headers
+ * - Audit logging
  */
 
-const fetch = require('node-fetch');
-
-// ========== CONFIG ==========
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
-const AUDIT_SHEET_ID = process.env.AUDIT_SHEET_ID;
+const FRONTEND_ORIGIN = 'https://han280190.github.io';
 
-// In-memory storage (reset mỗi deploy, đủ cho 3 user)
-// Tương lai: upgrade sang Vercel KV nếu cần persistent
-const rateLimitMap = new Map(); // { userName: { failCount, lockedUntil } }
-const sessionMap = new Map();   // { token: { userName, expiresAt } }
+// Rate limiting: userName -> { failCount, lockUntil }
+const rateLimits = {};
 
-const RATE_LIMIT_MAX_FAILS = 5;
-const RATE_LIMIT_LOCK_MINUTES = 10;
-const SESSION_DURATION_MINUTES = 30;
+// Session tokens: token -> { userName, expiresAt }
+const sessions = {};
 
-// ========== HELPERS ==========
+module.exports = (req, res) => {
+  // === CORS Headers ===
+  res.setHeader('Access-Control-Allow-Origin', FRONTEND_ORIGIN);
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
-function generateToken() {
-  return require('crypto').randomBytes(16).toString('hex');
+  // Only POST allowed
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  }
+
+  let body = {};
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: 'Invalid JSON' });
+  }
+
+  const { action, userName, pin, token } = body;
+
+  try {
+    // === Route actions ===
+    
+    if (action === 'login') {
+      // Frontend: send PIN → Proxy verify → Proxy create token
+      return handleLogin(res, userName, pin);
+    }
+
+    // All other actions require valid session token
+    if (!token || !validateSessionToken(token)) {
+      return res.status(401).json({ ok: false, error: 'Invalid or expired token' });
+    }
+
+    // Forward to Apps Script with API key
+    return forwardToAppsScript(res, body);
+
+  } catch (err) {
+    console.error('Proxy error:', err);
+    return res.status(500).json({ ok: false, error: 'Server error: ' + err.message });
+  }
+};
+
+// ============ LOGIN HANDLER ============
+
+function handleLogin(res, userName, pin) {
+  if (!userName || !pin) {
+    return res.status(400).json({ ok: false, error: 'Missing userName or pin' });
+  }
+
+  // Check rate limit
+  const now = Date.now();
+  const limit = rateLimits[userName];
+  
+  if (limit && limit.lockUntil > now) {
+    const secondsLeft = Math.ceil((limit.lockUntil - now) / 1000);
+    return res.status(429).json({ 
+      ok: false, 
+      error: `Bị khóa. Thử lại sau ${secondsLeft} giây` 
+    });
+  }
+
+  // Verify PIN via Apps Script
+  verifyPinViaAppsScript(userName, pin, (err, result) => {
+    if (err || !result.ok) {
+      // Increment fail count
+      if (!rateLimits[userName]) {
+        rateLimits[userName] = { failCount: 0, lockUntil: 0 };
+      }
+      rateLimits[userName].failCount++;
+
+      // Lock after 5 fails for 10 minutes
+      if (rateLimits[userName].failCount >= 5) {
+        rateLimits[userName].lockUntil = Date.now() + 10 * 60 * 1000;
+        return res.status(429).json({ 
+          ok: false, 
+          error: 'Bị khóa 10 phút vì nhập sai PIN quá lần' 
+        });
+      }
+
+      return res.status(401).json({ 
+        ok: false, 
+        error: result ? result.error : err.message 
+      });
+    }
+
+    // PIN correct - create session token
+    const token = generateToken();
+    const expiresAt = Date.now() + 30 * 60 * 1000; // 30 min
+    sessions[token] = { userName, expiresAt };
+
+    // Reset fail count
+    rateLimits[userName].failCount = 0;
+
+    return res.status(200).json({
+      ok: true,
+      token,
+      userName,
+      expiresAt
+    });
+  });
 }
 
-function isRateLimited(userName) {
-  const record = rateLimitMap.get(userName);
-  if (!record) return false;
-  if (Date.now() > record.lockedUntil) {
-    rateLimitMap.delete(userName);
+// ============ APPS SCRIPT COMMUNICATION ============
+
+function verifyPinViaAppsScript(userName, pin, callback) {
+  const payload = {
+    action: 'verifyPin',
+    userName,
+    pin,
+    apiKey: API_SECRET_KEY
+  };
+
+  const body = JSON.stringify(payload);
+  const fetchURL = APPS_SCRIPT_URL;
+
+  fetch(fetchURL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body
+  })
+    .then(res => res.json())
+    .then(data => callback(null, data))
+    .catch(err => callback(err, null));
+}
+
+function forwardToAppsScript(res, body) {
+  // Add API key to request
+  body.apiKey = API_SECRET_KEY;
+
+  const fetchURL = APPS_SCRIPT_URL;
+
+  fetch(fetchURL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+    .then(r => r.json())
+    .then(data => {
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(200).send(JSON.stringify(data));
+    })
+    .catch(err => {
+      console.error('Apps Script error:', err);
+      return res.status(502).json({ ok: false, error: 'Apps Script error: ' + err.message });
+    });
+}
+
+// ============ SESSION MANAGEMENT ============
+
+function generateToken() {
+  return 'tok_' + Math.random().toString(36).substring(2, 15) + 
+         Math.random().toString(36).substring(2, 15);
+}
+
+function validateSessionToken(token) {
+  if (!sessions[token]) return false;
+  const session = sessions[token];
+  if (session.expiresAt < Date.now()) {
+    delete sessions[token];
     return false;
   }
   return true;
 }
 
-function recordFailedAttempt(userName) {
-  const record = rateLimitMap.get(userName) || { failCount: 0, lockedUntil: 0 };
-  record.failCount++;
-  if (record.failCount >= RATE_LIMIT_MAX_FAILS) {
-    record.lockedUntil = Date.now() + RATE_LIMIT_LOCK_MINUTES * 60000;
-  }
-  rateLimitMap.set(userName, record);
-}
+// ============ CLEANUP ============
 
-function clearRateLimit(userName) {
-  rateLimitMap.delete(userName);
-}
-
-function createSession(userName) {
-  const token = generateToken();
-  const expiresAt = Date.now() + SESSION_DURATION_MINUTES * 60000;
-  sessionMap.set(token, { userName, expiresAt });
-  return { token, expiresAt };
-}
-
-function validateSession(token) {
-  const session = sessionMap.get(token);
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) {
-    sessionMap.delete(token);
-    return null;
-  }
-  return session;
-}
-
-async function logAudit(userName, action, details) {
-  // Log audit vào Google Sheets sheet "11. Audit_log"
-  // Format: Timestamp | UserName | Action | Details
-  // Tương lai: dùng Google Sheets API để append
-  // Hiện tại: print to console (Vercel logs)
-  const timestamp = new Date().toISOString();
-  console.log(`[AUDIT] ${timestamp} | ${userName} | ${action} | ${JSON.stringify(details)}`);
-  
-  // TODO v14.1: Append vào Google Sheets qua API
-}
-
-async function forwardToAppsScript(action, userName, params) {
-  /**
-   * Forward request tới Apps Script backend
-   * Gửi API_SECRET_KEY thay vì PIN
-   */
-  const payload = {
-    action,
-    userName,
-    apiKey: API_SECRET_KEY, // Backend sẽ verify key này
-    ...params
-  };
-
-  try {
-    const response = await fetch(APPS_SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      timeout: 30000
-    });
-
-    if (!response.ok) {
-      return { ok: false, error: `Apps Script error: ${response.status}` };
+// Clean expired sessions every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(sessions).forEach(token => {
+    if (sessions[token].expiresAt < now) {
+      delete sessions[token];
     }
-
-    const data = await response.json();
-    return data;
-  } catch (error) {
-    console.error('[ERROR] Forward to Apps Script failed:', error);
-    return { ok: false, error: 'Backend connection failed' };
-  }
-}
-
-// ========== MAIN HANDLER ==========
-
-module.exports = async (req, res) => {
-  // CORS - Allow GitHub Pages origin
-  res.setHeader('Access-Control-Allow-Origin', 'https://han280190.github.io');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(400).json({ ok: false, error: 'POST only' });
-  }
-
-  const { action, userName, pin, token, ...otherParams } = req.body;
-
-  // ===== ACTION 1: LOGIN (verify PIN → create token) =====
-  if (action === 'login') {
-    if (!userName || !pin) {
-      return res.status(400).json({ ok: false, error: 'Missing userName or pin' });
-    }
-
-    // Check rate limit
-    if (isRateLimited(userName)) {
-      await logAudit(userName, 'LOGIN_ATTEMPT', { result: 'RATE_LIMITED' });
-      return res.status(429).json({ ok: false, error: 'Too many failed attempts. Try again in 10 minutes.' });
-    }
-
-    // Verify PIN từ Apps Script (backend read từ USERS sheet)
-    const verifyRes = await forwardToAppsScript('verifyPin', userName, { pin });
-    
-    if (!verifyRes.ok || !verifyRes.verified) {
-      recordFailedAttempt(userName);
-      await logAudit(userName, 'LOGIN_FAILED', { attempt: rateLimitMap.get(userName)?.failCount || 1 });
-      return res.status(401).json({ ok: false, error: 'Invalid PIN' });
-    }
-
-    // PIN đúng → create session token
-    clearRateLimit(userName);
-    const { token: newToken, expiresAt } = createSession(userName);
-    await logAudit(userName, 'LOGIN_SUCCESS', { tokenExpiresAt: new Date(expiresAt).toISOString() });
-
-    return res.json({ ok: true, token: newToken, expiresAt });
-  }
-
-  // ===== ACTION 2: API calls (require valid token) =====
-  // monthCalendar, createBooking, updateBooking, etc.
-  if (!token) {
-    return res.status(401).json({ ok: false, error: 'Missing token' });
-  }
-
-  const session = validateSession(token);
-  if (!session) {
-    return res.status(401).json({ ok: false, error: 'Invalid or expired token' });
-  }
-
-  // Token valid → forward to Apps Script
-  const apiRes = await forwardToAppsScript(action, session.userName, {
-    ...otherParams
   });
-
-  // Log audit for data-modifying actions
-  if (['createBooking', 'updateBooking', 'cancelBooking', 'updateStatus'].includes(action)) {
-    await logAudit(session.userName, action, otherParams);
-  }
-
-  return res.json(apiRes);
-};
+}, 5 * 60 * 1000);
