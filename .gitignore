@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+.npm
+.yarn
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Vercel
+.vercel
+.vercel/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+.vscode/
+.idea/
+
+# Build
+dist/
+build/

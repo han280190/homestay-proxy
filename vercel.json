@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "functions": {
+    "api/proxy.js": {
+      "memory": 128,
+      "maxDuration": 30
+    }
+  },
+  "env": [
+    "APPS_SCRIPT_URL",
+    "API_SECRET_KEY",
+    "AUDIT_SHEET_ID"
+  ]
+}
